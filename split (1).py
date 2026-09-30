@@ -5,23 +5,30 @@ from genlayer import *
 
 class Split(gl.Contract):
     """
-    Revenue/royalty split contract, equivalent in behavior to thirdweb's
-    Split contract:
+    Milestone-gated revenue/royalty split contract for GenLayer.
+
+    This is a thirdweb-style Split contract (fixed payees, weighted
+    shares, pull-safe accounting) extended with a genuine Intelligent
+    Contract mechanism: payouts stay locked until a real-world milestone
+    has been independently verified by validators.
 
       - Define a fixed set of payees, each with an integer number of
-        "shares" (weights). They don't need to sum to 100 — a payee's
-        cut is share / total_shares.
+        "shares" (weights). A payee's cut is share / total_shares.
       - Anyone can send GEN into the contract via deposit().
-      - Calling distribute() pays every payee their owed amount at once.
-      - Calling release(payee) pays just one payee (useful if one
-        recipient's transfer is failing and you don't want to block
-        the others).
+      - The owner calls check_milestone(). Each validator independently
+        fetches `milestone_url` and judges, via GenLayer's equivalence
+        principle, whether `milestone_criteria` is satisfied. Only once
+        validators reach consensus is the boolean result committed.
+      - distribute() / release() only pay out once milestone_reached is
+        True. The non-deterministic check materially gates the
+        contract's core action — it is not a side feature.
 
     Accounting uses the same "total received / already released" pattern
     as OpenZeppelin's PaymentSplitter, so it stays correct even if
     distribute() is called multiple times as new funds keep arriving.
     """
 
+    owner: Address
     payees: DynArray[Address]
     shares: TreeMap[Address, u256]
     total_shares: u256
@@ -29,7 +36,17 @@ class Split(gl.Contract):
     total_released: u256
     released: TreeMap[Address, u256]
 
-    def __init__(self, payees: list[str], shares_list: list[int]):
+    milestone_url: str
+    milestone_criteria: str
+    milestone_reached: bool
+
+    def __init__(
+        self,
+        payees: list[str],
+        shares_list: list[int],
+        milestone_url: str,
+        milestone_criteria: str,
+    ):
         if len(payees) == 0:
             raise Exception("Split: no payees")
         if len(payees) != len(shares_list):
@@ -49,28 +66,80 @@ class Split(gl.Contract):
             self.released[addr] = u256(0)
             total += u256(share)
 
+        self.owner = gl.message.sender_address
         self.total_shares = total
         self.total_received = u256(0)
         self.total_released = u256(0)
 
-    # --- funding -------------------------------------------------------
+        self.milestone_url = milestone_url
+        self.milestone_criteria = milestone_criteria
+        self.milestone_reached = False
+
+    # --- milestone check (material non-deterministic mechanism) --------
+
+    @gl.public.write
+    def check_milestone(self) -> None:
+        """
+        Have validators independently fetch `milestone_url` and judge,
+        via the equivalence principle, whether `milestone_criteria` is
+        satisfied. distribute()/release() are gated on the result.
+        """
+        if gl.message.sender_address != self.owner:
+            raise Exception("Split: only owner can check the milestone")
+
+        url = self.milestone_url
+        criteria_text = self.milestone_criteria
+
+        def get_input() -> str:
+            # Non-deterministic: each validator independently fetches
+            # the page — content, timing, and rendering can vary.
+            return gl.nondet.web.render(url, mode="text")
+
+        answer = gl.eq_principle.prompt_non_comparative(
+            get_input,
+            task=(
+                "Based on the page content provided, determine whether "
+                f"the following milestone has been reached: {criteria_text}. "
+                "Respond with exactly one word: True or False."
+            ),
+            criteria="""
+            The response must be exactly one word — either "True" or
+            "False" — and must correctly reflect, based on the page
+            content, whether the stated milestone has been reached.
+            """,
+        )
+
+        self.milestone_reached = str(answer).strip().lower().startswith("true")
+
+    @gl.public.write
+    def reset_milestone(self) -> None:
+        """Owner-only: re-lock payouts, e.g. before checking a new milestone."""
+        if gl.message.sender_address != self.owner:
+            raise Exception("Split: only owner can reset the milestone")
+        self.milestone_reached = False
+
+    # --- funding ---------------------------------------------------------
 
     @gl.public.write.payable
     def deposit(self) -> None:
         """Send GEN here to have it split among the payees."""
         self.total_received += u256(gl.message.value)
 
-    # --- distribution ----------------------------------------------------
+    # --- distribution ------------------------------------------------------
 
     @gl.public.write
     def distribute(self) -> None:
-        """Pay every payee their currently owed share."""
+        """Pay every payee their currently owed share, once the milestone has been reached."""
+        if not self.milestone_reached:
+            raise Exception("Split: milestone not yet reached, call check_milestone() first")
         for payee in self.payees:
             self._release(payee)
 
     @gl.public.write
     def release(self, payee: str) -> None:
-        """Pay a single payee their currently owed share."""
+        """Pay a single payee their currently owed share, once the milestone has been reached."""
+        if not self.milestone_reached:
+            raise Exception("Split: milestone not yet reached, call check_milestone() first")
         self._release(Address(payee))
 
     def _release(self, payee: Address) -> None:
@@ -89,7 +158,7 @@ class Split(gl.Contract):
 
         gl.get_contract_at(payee).emit_transfer(value=int(owed))
 
-    # --- views -----------------------------------------------------------
+    # --- views -------------------------------------------------------------
 
     @gl.public.view
     def get_payees(self) -> list[str]:
@@ -114,3 +183,7 @@ class Split(gl.Contract):
     @gl.public.view
     def get_total_released(self) -> int:
         return int(self.total_released)
+
+    @gl.public.view
+    def get_milestone_reached(self) -> bool:
+        return self.milestone_reached
